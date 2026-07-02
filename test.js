@@ -1,79 +1,70 @@
-const http = require('http');
-const sharp = require('sharp');
+const express = require('express');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { Transformer } = require('@napi-rs/image');
+const http = require('http');
 
-const logMemory = (step) => {
-  const memory = process.memoryUsage();
-  console.log(`[${step}] RSS: ${(memory.rss / 1024 / 1024).toFixed(2)} MB | Heap Used: ${(memory.heapUsed / 1024 / 1024).toFixed(2)} MB`);
-};
+const app = express();
+app.use(express.json());
 
-const WIDTH = 4000;
-const HEIGHT = 3000;
-
-function createMockRgbaBuffer() {
-  return Buffer.alloc(WIDTH * HEIGHT * 4, 255);
-}
-
-async function runSharpTest(rgbaBuffer, iterations = 20) {
-  console.log('\n--- Starting Sharp Processing Run ---');
-  logMemory('Initial');
-  for (let i = 0; i < iterations; i++) {
-    await sharp(rgbaBuffer, { raw: { width: WIDTH, height: HEIGHT, channels: 4 } })
-      .resize(800)
-      .webp({ quality: 80 })
-      .toBuffer();
-    if (i % 5 === 0) logMemory(`Loop ${i}`);
-  }
-  if (global.gc) global.gc();
-  await new Promise(r => setTimeout(r, 2000));
-  logMemory('Sharp Post-GC Idle');
-}
-
-async function runNapiTest(rgbaBuffer, iterations = 20) {
-  console.log('\n--- Starting @napi-rs/image Processing Run ---');
-  logMemory('Initial');
-  for (let i = 0; i < iterations; i++) {
-    const transformer = Transformer.fromRgbaPixels(rgbaBuffer, WIDTH, HEIGHT);
-    transformer.resize(800);
-    await transformer.webp(80);
-    if (i % 5 === 0) logMemory(`Loop ${i}`);
-  }
-  if (global.gc) global.gc();
-  await new Promise(r => setTimeout(r, 2000));
-  logMemory('Napi Post-GC Idle');
-}
-
-// 1. Create a basic HTTP Server to satisfy DigitalOcean App Platform
-const server = http.createServer(async (req, res) => {
-  // Health check route for DigitalOcean Ingress
-  if (req.url === '/' || req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('OK');
-  }
-
-  // Trigger the benchmark test manually by visiting /test
-  if (req.url === '/test') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.write('Benchmark started! Check your DigitalOcean console logs...\n');
-    
-    try {
-      const rgbaBuffer = createMockRgbaBuffer();
-      await runSharpTest(rgbaBuffer);
-      await runNapiTest(rgbaBuffer);
-      res.write('Benchmark completed successfully.\n');
-    } catch (err) {
-      console.error(err);
-      res.write(`Error: ${err.message}\n`);
-    }
-    return res.end();
-  }
-
-  res.writeHead(404);
-  res.end();
+// Initialize S3/Spaces Client using environment variables
+const s3Client = new S3Client({
+  endpoint: `https://${process.env.SPACES_REGION}.digitaloceanspaces.com`,
+  region: process.env.SPACES_REGION,
+  credentials: {
+    accessKeyId: process.env.SPACES_KEY,
+    secretAccessKey: process.env.SPACES_SECRET,
+  },
 });
 
-// DigitalOcean App Platform defaults to port 8080
+// Health check endpoint for DigitalOcean App Platform
+app.get('/', (req, res) => res.send('OK'));
+
+// The main optimization endpoint
+app.post('/upload-and-optimize', async (req, res) => {
+  const { imageUrl } = req.body; // Pass any image URL to test with
+  
+  if (!imageUrl) {
+    return res.status(400).json({ error: 'Missing imageUrl in request body' });
+  }
+
+  try {
+    console.log(`[Start] Fetching image from: ${imageUrl}`);
+    
+    // 1. Download the image into memory buffer
+    const response = await fetch(imageUrl);
+    const arrayBuffer = await response.arrayBuffer();
+    const inputBuffer = Buffer.from(arrayBuffer);
+
+    console.log(`[Processing] Ingesting into @napi-rs/image...`);
+    // 2. Convert to WebP via Napi
+    const transformer = new Transformer(inputBuffer);
+    transformer.resize(1200); // Scale down width cleanly
+    const webpBuffer = await transformer.webp(80); // Encode to 80% quality webp
+
+    // 3. Define unique storage key path
+    const fileKey = `processed/image_${Date.now()}.webp`;
+
+    console.log(`[Spaces] Uploading to bucket: ${process.env.SPACES_BUCKET}`);
+    // 4. Send to DigitalOcean Spaces
+    await s3Client.send(new PutObjectCommand({
+      Bucket: process.env.SPACES_BUCKET,
+      Key: fileKey,
+      Body: webpBuffer,
+      ContentType: 'image/webp',
+      ACL: 'public-read' // Makes it accessible via CDN URL
+    }));
+
+    const finalCdnUrl = `https://${process.env.SPACES_BUCKET}.${process.env.SPACES_REGION}.digitaloceanspaces.com/${fileKey}`;
+    console.log(`[Success] Saved to ${finalCdnUrl}`);
+
+    res.json({ success: true, url: finalCdnUrl });
+  } catch (error) {
+    console.error('[Error Details]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`Server is listening on port ${PORT}. Health checks passing.`);
+app.listen(PORT, () => {
+  console.log(`Image pipeline app listening on port ${PORT}`);
 });
