@@ -1,0 +1,13 @@
+{
+  "name": "image-memory-sandbox",
+  "version": "1.0.0",
+  "description": "Sandbox to compare glibc memory behaviors between Sharp and NAPI-rs",
+  "main": "test.js",
+  "scripts": {
+    "start": "node test.js"
+  },
+  "dependencies": {
+    "@napi-rs/image": "^1.13.0",
+    "sharp": "^0.33.5"
+  }
+}
